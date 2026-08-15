@@ -166,11 +166,16 @@ class DetailViewModel : ViewModel() {
                             TioPlusProvider.searchServers(
                                 title = title,
                                 type = type,
+                                alternateTitle = detail.originalTitle,
                                 seasonNum = _selectedSeason.value,
                                 episodeNum = ep!!.episodeNumber,
                             )
                         } else {
-                            TioPlusProvider.searchServers(title = title, type = type)
+                            TioPlusProvider.searchServers(
+                                title = title,
+                                type = type,
+                                alternateTitle = detail.originalTitle,
+                            )
                         }
                     } catch (e: Exception) {
                         LogCollector.log("ERROR", "TioPlus: ${e.message}")

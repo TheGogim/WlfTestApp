@@ -7,7 +7,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 
 object TioPlusProvider {
@@ -34,221 +33,190 @@ object TioPlusProvider {
         val response = client.newCall(request).execute()
         val body = response.body?.string() ?: throw Exception("Empty response")
         if (!response.isSuccessful) {
-            log("ERROR", "HTTP ${response.code}: ${response.message}")
-            throw Exception("HTTP ${response.code}: ${response.message}")
+            log("RESPONSE", "HTTP ${response.code}")
+            throw Exception("HTTP ${response.code}")
         }
         log("RESPONSE", "${response.code} OK (${body.length} chars)")
         body
     }
 
-    private fun normalize(s: String): String {
-        val noAccents = java.text.Normalizer.normalize(s, java.text.Normalizer.Form.NFD)
+    // --- Slug generation ---
+
+    /**
+     * Slug limpio: quita tildes, mayusculas, TODO excepto a-z 0-9 y espacios.
+     * "Vengadores: Endgame" -> "vengadores-endgame"
+     * "La casa del dragon" -> "la-casa-del-dragon"
+     */
+    private fun toSlugClean(title: String): String {
+        return java.text.Normalizer.normalize(title, java.text.Normalizer.Form.NFD)
             .replace(Regex("\\p{InCombiningDiacriticalMarks}+"), "")
-        return noAccents.lowercase()
-            .replace(Regex("[^a-z0-9 ]"), " ")
-            .replace(Regex("\\s+"), " ")
-            .trim()
+            .lowercase()
+            .replace(Regex("[^a-z0-9 ]"), "")
+            .replace(Regex("\\s+"), "-")
+            .trim('-')
     }
-
-    private fun isMatch(found: String, target: String): Boolean {
-        val nFound = normalize(found)
-        val nTarget = normalize(target)
-        if (nFound == nTarget) return true
-        if (nFound.contains(nTarget) || nTarget.contains(nFound)) return true
-        val foundWords = nFound.split(" ").filter { it.length > 2 }.toSet()
-        val targetWords = nTarget.split(" ").filter { it.length > 2 }.toSet()
-        if (foundWords.isEmpty() || targetWords.isEmpty()) return false
-        return foundWords.intersect(targetWords).size.toFloat() / targetWords.size >= 0.5f
-    }
-
-    // --- Search result parsing ---
-
-    private data class SearchResult(
-        val title: String,
-        val slug: String,
-        val type: String, // "pelicula" o "serie"
-    )
 
     /**
-     * Parsea los resultados HTML de /api/search/{query}
-     * Formato: <article>...<a href="https://tioplus.app/pelicula/slug">...<span class="typeItem movie">Pelicúla</span>...<h2>Title (Year)</h2>...</article>
+     * Slug manteniendo puntos: quita tildes y :?!;"' etc, pero guarda los puntos.
+     * "S.W.A.T." -> "s.w.a.t."
+     * "Dr. Strange" -> "dr.-strange"
      */
-    private fun parseSearchResults(html: String): List<SearchResult> {
-        val results = mutableListOf<SearchResult>()
-        val articleRegex = Regex("""<article class='item liste relative'>\s*<a class='itemA' href="([^"]+)">(\s|\S)*?<h2>([^<]+)</h2>(\s|\S)*?<span class="typeItem(movie)?">([^<]*)</span>""")
+    private fun toSlugWithDots(title: String): String {
+        return java.text.Normalizer.normalize(title, java.text.Normalizer.Form.NFD)
+            .replace(Regex("\\p{InCombiningDiacriticalMarks}+"), "")
+            .lowercase()
+            .replace(Regex("[^a-z0-9. ]"), "")
+            .replace(Regex("\\s+"), "-")
+            .trim('-')
+    }
 
-        // Más simple: extraer hrefs y títulos por separado
-        val hrefRegex = Regex("""<a class='itemA' href="(https://tioplus\.app/(?:pelicula|serie)/[^"]+)"""")
-        val titleRegex = Regex("""<h2>([^<]+)</h2>""")
-        val typeRegex = Regex("""<span class="typeItem(movie)?">([^<]+)</span>""")
+    /**
+     * Genera variaciones de slug en orden de prioridad:
+     * 1. Slug limpio del titulo principal
+     * 2. Slug con puntos del titulo principal
+     * 3. Slug limpio del titulo alternativo (otro idioma)
+     * 4. Slug con puntos del titulo alternativo
+     */
+    private fun generateSlugVariations(
+        title: String,
+        alternateTitle: String?,
+    ): List<Pair<String, String>> {
+        val variations = mutableListOf<Pair<String, String>>()
 
-        val hrefs = hrefRegex.findAll(html).map { it.groupValues[1] }.toList()
-        val titles = titleRegex.findAll(html).map { it.groupValues[1] }.toList()
-        val types = typeRegex.findAll(html).map {
-            val isMovie = it.groupValues[1].isNotEmpty()
-            if (isMovie) "pelicula" else "serie"
-        }.toList()
-
-        val count = minOf(hrefs.size, titles.size, types.size)
-        for (i in 0 until count) {
-            val slug = hrefs[i].trimEnd('/').substringAfterLast('/')
-            results.add(SearchResult(
-                title = titles[i].trim(),
-                slug = slug,
-                type = types[i],
-            ))
+        // 1. Slug limpio del titulo principal
+        val clean1 = toSlugClean(title)
+        if (clean1.isNotBlank()) {
+            variations.add(clean1 to "limpio ($title)")
         }
-        return results
+
+        // 2. Slug con puntos del titulo principal
+        val dots1 = toSlugWithDots(title)
+        if (dots1.isNotBlank() && dots1 != clean1) {
+            variations.add(dots1 to "con puntos ($title)")
+        }
+
+        // 3 y 4. Titulo alternativo (otro idioma)
+        if (!alternateTitle.isNullOrBlank() && alternateTitle != title) {
+            val clean2 = toSlugClean(alternateTitle)
+            if (clean2.isNotBlank() && clean2 != clean1) {
+                variations.add(clean2 to "limpio alt ($alternateTitle)")
+            }
+
+            val dots2 = toSlugWithDots(alternateTitle)
+            if (dots2.isNotBlank() && dots2 != dots1 && dots2 != clean2) {
+                variations.add(dots2 to "con puntos alt ($alternateTitle)")
+            }
+        }
+
+        return variations
     }
 
-    /**
-     * Extrae los servidores de una página de película o episodio.
-     * Busca <li data-server="base64">  <span>Nombre - Opción N</span>...
-     * y también el <button> que indica el idioma.
-     */
+    // --- Server parsing ---
+
     private fun parseServers(html: String): List<ProviderServer> {
         val servers = mutableListOf<ProviderServer>()
 
-        // Extraer bloques de idioma: cada <div> dentro de .bg-tabs contiene un button + ul.subselect
-        // El button tiene el nombre del idioma (ej: "Español Latino")
-        // Los <li data-server="..."> tienen los servidores
+        val langRegex = Regex("""<button class='active button'>[^<]*<img[^>]*>([^<]+)""")
+        val language = langRegex.find(html)?.groupValues?.get(1)?.trim() ?: "Latino"
+        log("PARSE", "Idioma detectado: \"$language\"")
 
-        // Regex para los bloques: button con texto de idioma seguido de ul.subselect con li data-server
-        val blockRegex = Regex(
-            """<button class='active button'>[^<]*<img[^>]*>\s*([^<]+)""" +
-            """[\\s\\S]*?<ul class='subselect'>([\\s\\S]*?)</ul>"""
-        )
+        val serverRegex = Regex("""data-server="([^"]+)"[^<]*<span>([^<]+)</span>""")
+        val matches = serverRegex.findAll(html).toList()
 
-        val blocks = blockRegex.findAll(html).toList()
+        log("PARSE", "${matches.size} servidor(es) en HTML")
 
-        // Si no funciona el block regex, intentar extraer directamente
-        val serverRegex = Regex("""data-server="([^"]+)"[\\s\\S]*?<span>([^<]+)</span>""")
-
-        // Primero intentar por bloques de idioma
-        if (blocks.isNotEmpty()) {
-            for (block in blocks) {
-                val language = block.groupValues[1].trim()
-                val ulContent = block.groupValues[2]
-                val liRegex = Regex("""data-server="([^"]+)"[\\s\\S]*?<span>([^<]+)</span>""")
-                val matches = liRegex.findAll(ulContent).toList()
-                for (m in matches) {
-                    val b64 = m.groupValues[1]
-                    val serverName = m.groupValues[2].trim()
-                    val embedUrl = "$BASE_URL/player/$b64"
-                    servers.add(ProviderServer(
-                        providerName = PROVIDER_NAME,
-                        language = language,
-                        serverName = serverName,
-                        embedUrl = embedUrl,
-                        domain = "tioplus.app/player",
-                    ))
-                }
-            }
-        } else {
-            // Fallback: extraer todos los data-server directamente
-            val matches = serverRegex.findAll(html).toList()
-            // Intentar obtener el idioma del primer button
-            val langMatch = Regex("""<button class='active button'>[^<]*<img[^>]*>\s*([^<]+)""").find(html)
-            val language = langMatch?.groupValues?.get(1)?.trim() ?: "Latino"
-            for (m in matches) {
-                val b64 = m.groupValues[1]
-                val serverName = m.groupValues[2].trim()
-                val embedUrl = "$BASE_URL/player/$b64"
-                servers.add(ProviderServer(
-                    providerName = PROVIDER_NAME,
-                    language = language,
-                    serverName = serverName,
-                    embedUrl = embedUrl,
-                    domain = "tioplus.app/player",
-                ))
-            }
+        for (m in matches) {
+            val b64 = m.groupValues[1]
+            val serverName = m.groupValues[2].trim()
+            val embedUrl = "$BASE_URL/player/$b64"
+            servers.add(ProviderServer(
+                providerName = PROVIDER_NAME,
+                language = language,
+                serverName = serverName,
+                embedUrl = embedUrl,
+                domain = "tioplus.app/player",
+            ))
         }
 
         return servers
     }
 
-    // --- Función principal ---
+    // --- Funcion principal ---
 
+    /**
+     * Busca servidores construyendo directamente el slug desde el titulo de TMDB.
+     * No usa /api/search/ porque es muy poco confiable con titulos complejos.
+     *
+     * Intenta multiple variaciones de slug:
+     * - Limpios (sin tildes, puntos, dos puntos, etc.)
+     * - Con puntos (si el titulo los tiene)
+     * - En titulo alternativo (otro idioma) como ultimo recurso
+     *
+     * @param title Titulo principal (el que da TMDB en el idioma solicitado)
+     * @param type MOVIE o TV
+     * @param alternateTitle Titulo en el otro idioma (originalTitle de TMDB)
+     */
     suspend fun searchServers(
         title: String,
         type: ShowType,
+        alternateTitle: String? = null,
         seasonNum: Int? = null,
         episodeNum: Int? = null,
     ): List<ProviderServer> {
-        log("INFO", "═══ TioPlus — Iniciando búsqueda ═══")
-        log("INFO", "Título: \"$title\" | Tipo: ${if (type == ShowType.TV) "Serie" else "Película"}" +
+        log("INFO", "═══ TioPlus — Busqueda por slug directo ═══")
+        log("INFO", "Titulo: \"$title\" | Tipo: ${if (type == ShowType.TV) "Serie" else "Pelicula"}" +
                 (if (seasonNum != null) " | Temporada $seasonNum, Episodio $episodeNum" else ""))
-
-        // 1. Buscar en la API
-        val query = URLEncoder.encode(title, "UTF-8")
-        val searchUrl = "$BASE_URL/api/search/$query"
-        val searchHtml = try {
-            httpGet(searchUrl)
-        } catch (e: Exception) {
-            log("ERROR", "Error en búsqueda: ${e.message}")
-            return emptyList()
+        if (!alternateTitle.isNullOrBlank() && alternateTitle != title) {
+            log("INFO", "Titulo alternativo: \"$alternateTitle\"")
         }
 
-        if (searchHtml.contains("No hay resultados")) {
-            log("ERROR", "Sin resultados en TioPlus para \"$title\"")
-            return emptyList()
+        val path = if (type == ShowType.TV) "serie" else "pelicula"
+
+        val variations = generateSlugVariations(title, alternateTitle)
+        log("INFO", "Variaciones de slug: ${variations.size}")
+        variations.forEachIndexed { i, (slug, desc) ->
+            log("INFO", "  Slug ${i + 1}: \"$slug\" ($desc)")
         }
 
-        val results = parseSearchResults(searchHtml)
-        log("INFO", "${results.size} resultado(s) en TioPlus")
-        results.forEach {
-            log("INFO", "  → ${it.title} (${it.type})")
+        for ((slug, desc) in variations) {
+            val url = if (type == ShowType.TV && seasonNum != null && episodeNum != null) {
+                "$BASE_URL/$path/$slug/season/$seasonNum/episode/$episodeNum"
+            } else if (type == ShowType.TV) {
+                log("ERROR", "Se necesita temporada y episodio para series")
+                return emptyList()
+            } else {
+                "$BASE_URL/$path/$slug"
+            }
+
+            try {
+                val html = httpGet(url)
+
+                if (!html.contains("data-server")) {
+                    log("INFO", "Sin servidores con slug \"$slug\", probando siguiente...")
+                    continue
+                }
+
+                log("MATCH", "Slug encontrado: \"$slug\" ($desc)")
+
+                val servers = parseServers(html)
+                if (servers.isEmpty()) {
+                    log("ERROR", "HTML tiene data-server pero no se parsearon servidores")
+                    continue
+                }
+
+                log("SUCCESS", "═══ ${servers.size} servidores listos ═══")
+                servers.forEach {
+                    log("INFO", "    → [${it.language}] ${it.serverName}")
+                }
+
+                return servers
+            } catch (e: Exception) {
+                log("INFO", "Slug \"$slug\" fallo: ${e.message}")
+                continue
+            }
         }
 
-        // 2. Fuzzy match
-        val expectedType = if (type == ShowType.TV) "serie" else "pelicula"
-        val match = results.firstOrNull { result ->
-            result.type == expectedType && isMatch(result.title, title)
-        }
-
-        if (match == null) {
-            log("ERROR", "Sin coincidencia para \"$title\" como $expectedType")
-            return emptyList()
-        }
-
-        log("MATCH", "\"${match.title}\" (${match.slug})")
-
-        // 3. Construir URL de la página
-        val pageUrl = if (type == ShowType.TV && seasonNum != null && episodeNum != null) {
-            val url = "$BASE_URL/serie/${match.slug}/season/$seasonNum/episode/$episodeNum"
-            log("INFO", "URL episodio: $url")
-            url
-        } else if (type == ShowType.TV) {
-            // Sin episodio seleccionado, no podemos buscar
-            log("ERROR", "Se necesita temporada y episodio para series")
-            return emptyList()
-        } else {
-            val url = "$BASE_URL/pelicula/${match.slug}"
-            log("INFO", "URL página: $url")
-            url
-        }
-
-        // 4. Obtener página y extraer servidores
-        val pageHtml = try {
-            httpGet(pageUrl)
-        } catch (e: Exception) {
-            log("ERROR", "Error cargando página: ${e.message}")
-            return emptyList()
-        }
-
-        val servers = parseServers(pageHtml)
-
-        if (servers.isEmpty()) {
-            log("ERROR", "No se encontraron servidores en la página")
-            return emptyList()
-        }
-
-        log("SUCCESS", "${servers.size} servidor(es) encontrado(s)")
-        servers.forEach {
-            log("INFO", "    → [${it.language}] ${it.serverName}")
-        }
-        log("SUCCESS", "═══ ${servers.size} servidores listos ═══")
-
-        return servers
+        log("ERROR", "Ningun slug funciono para \"$title\"")
+        return emptyList()
     }
 }
