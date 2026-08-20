@@ -78,19 +78,26 @@ class RpmvidExtractor : Extractor() {
             throw Exception("No se pudo decodificar respuesta de Rpmvid: ${e.message}")
         }
 
+        // Helper seguro para obtener string de un campo JSON
+        // (evita crash cuando el valor es JsonObject/JsonArray en vez de String)
+        fun safeGetString(obj: com.google.gson.JsonObject, field: String): String? {
+            val elem = obj.get(field) ?: return null
+            return if (elem.isJsonPrimitive) elem.asString else null
+        }
+
         // Campos estandar del API Rpmvid
-        val hlsPath = json.get("hls")?.asString?.takeIf { it.isNotEmpty() }
-        val hlsTiktok = json.get("hlsVideoTiktok")?.asString?.takeIf { it.isNotEmpty() }
-        var cfPath = json.get("cf")?.asString?.takeIf { it.isNotEmpty() }
-        val cfExpire = json.get("cfExpire")?.asString?.takeIf { it.isNotEmpty() }
+        val hlsPath = safeGetString(json, "hls")?.takeIf { it.isNotEmpty() }
+        val hlsTiktok = safeGetString(json, "hlsVideoTiktok")?.takeIf { it.isNotEmpty() }
+        var cfPath = safeGetString(json, "cf")?.takeIf { it.isNotEmpty() }
+        val cfExpire = safeGetString(json, "cfExpire")?.takeIf { it.isNotEmpty() }
 
         // Campos alternativos que algunos mirrors pueden usar
-        val altUrl = json.get("url")?.asString?.takeIf { it.isNotEmpty() }
-        val altSource = json.get("source")?.asString?.takeIf { it.isNotEmpty() }
-        val altFile = json.get("file")?.asString?.takeIf { it.isNotEmpty() }
-        val altVideoUrl = json.get("videoUrl")?.asString?.takeIf { it.isNotEmpty() }
-        val altM3u8 = json.get("m3u8")?.asString?.takeIf { it.isNotEmpty() }
-        val altStream = json.get("stream")?.asString?.takeIf { it.isNotEmpty() }
+        val altUrl = safeGetString(json, "url")?.takeIf { it.isNotEmpty() }
+        val altSource = safeGetString(json, "source")?.takeIf { it.isNotEmpty() }
+        val altFile = safeGetString(json, "file")?.takeIf { it.isNotEmpty() }
+        val altVideoUrl = safeGetString(json, "videoUrl")?.takeIf { it.isNotEmpty() }
+        val altM3u8 = safeGetString(json, "m3u8")?.takeIf { it.isNotEmpty() }
+        val altStream = safeGetString(json, "stream")?.takeIf { it.isNotEmpty() }
 
         // Buscar paths de video DENTRO del streamingConfig
         // Algunos mirrors no tienen hls/hlsVideoTiktok/cf como campos top-level,
@@ -115,9 +122,9 @@ class RpmvidExtractor : Extractor() {
                         LogCollector.log("DEBUG", "[Rpmvid] Proveedor $provider habilitado, buscando URL...")
 
                         // Buscar campo 'path' o 'url' en el config del proveedor
-                        val path = providerConfig.get("path")?.asString?.takeIf { it.isNotEmpty() }
-                        val pUrl = providerConfig.get("url")?.asString?.takeIf { it.isNotEmpty() }
-                        val hlsField = providerConfig.get("hls")?.asString?.takeIf { it.isNotEmpty() }
+                        val path = safeGetString(providerConfig, "path")?.takeIf { it.isNotEmpty() }
+                        val pUrl = safeGetString(providerConfig, "url")?.takeIf { it.isNotEmpty() }
+                        val hlsField = safeGetString(providerConfig, "hls")?.takeIf { it.isNotEmpty() }
 
                         if (!path.isNullOrEmpty() && path.startsWith("/")) {
                             configUrl = buildConfigUrl(mainLink, provider, path, providerConfig)
@@ -145,7 +152,7 @@ class RpmvidExtractor : Extractor() {
         if (configUrl == null) {
             val keys = json.keySet()
             for (key in keys) {
-                val valStr = json.get(key)?.asString ?: continue
+                val valStr = safeGetString(json, key) ?: continue
                 if (valStr.startsWith("/hls/") || valStr.startsWith("/cf/") ||
                     valStr.startsWith("/video/") || valStr.startsWith("/stream/")) {
                     configUrl = "$mainLink$valStr"
@@ -247,7 +254,8 @@ class RpmvidExtractor : Extractor() {
             "Google" -> providerConfig.get("domain")?.asString ?: mainLink
             else -> mainLink
         }
-        val params = providerConfig.getAsJsonObject("params")
+        val paramsElem = providerConfig.get("params")
+        val params = if (paramsElem != null && paramsElem.isJsonObject) paramsElem.asJsonObject else null
         var url = if (path.startsWith("http")) path else "$baseUrl$path"
         if (params != null) {
             val v = params.get("v")?.takeIf { !it.isJsonNull }?.asString

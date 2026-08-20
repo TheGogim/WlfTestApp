@@ -256,6 +256,8 @@ class FilemoonExtractor : Extractor() {
             (function() {
                 window.__fmUrls = [];
                 window.__fmAllRequests = [];
+                window.__fmVideoSrc = null;
+
                 // Interceptar XHR para capturar TODAS las respuestas relevantes
                 var origXHROpen = XMLHttpRequest.prototype.open;
                 var origXHRSend = XMLHttpRequest.prototype.send;
@@ -267,29 +269,68 @@ class FilemoonExtractor : Extractor() {
                     var self = this;
                     this.addEventListener('load', function() {
                         var url = self.__fmUrl || '';
-                        if ((url.indexOf('/api/') !== -1 || url.indexOf('playback') !== -1) && self.responseText) {
-                            window.__fmUrls.push('API:' + url + ' -> ' + self.responseText.substring(0, 1500));
-                        }
                         window.__fmAllRequests.push(url);
+                        if ((url.indexOf('/api/') !== -1 || url.indexOf('playback') !== -1 || url.indexOf('m3u8') !== -1 || url.indexOf('.mp4') !== -1) && self.responseText) {
+                            window.__fmUrls.push('API:' + url + ' -> ' + self.responseText.substring(0, 2000));
+                        }
                     });
                     return origXHRSend.apply(this, arguments);
                 };
+
                 // Interceptar fetch
                 if (window.fetch) {
                     var origFetch = window.fetch.bind(window);
                     window.fetch = function(input) {
+                        var inputUrl = (typeof input === 'string') ? input : (input.url || '');
+                        window.__fmAllRequests.push(inputUrl);
                         return origFetch.apply(this, arguments).then(function(resp) {
-                            var url = (typeof input === 'string') ? input : (input.url || '');
-                            if ((url.indexOf('/api/') !== -1 || url.indexOf('playback') !== -1)) {
+                            if ((inputUrl.indexOf('/api/') !== -1 || inputUrl.indexOf('playback') !== -1 || inputUrl.indexOf('m3u8') !== -1 || inputUrl.indexOf('.mp4') !== -1)) {
                                 var cloned = resp.clone();
                                 cloned.text().then(function(text) {
-                                    if (text) window.__fmUrls.push('API:' + url + ' -> ' + text.substring(0, 1500));
+                                    if (text) window.__fmUrls.push('API:' + inputUrl + ' -> ' + text.substring(0, 2000));
                                 });
                             }
-                            window.__fmAllRequests.push(url);
                             return resp;
                         });
                     };
+                }
+
+                // Interceptar setAttribute en elementos para capturar src de video
+                var origSetAttr = Element.prototype.setAttribute;
+                Element.prototype.setAttribute = function(name, value) {
+                    if ((name === 'src' || name === 'data-src') && value && value.indexOf('http') === 0 && (value.indexOf('.m3u8') !== -1 || value.indexOf('.mp4') !== -1)) {
+                        window.__fmVideoSrc = value;
+                    }
+                    return origSetAttr.apply(this, arguments);
+                };
+
+                // MutationObserver para detectar video elements agregados al DOM
+                var observer = new MutationObserver(function(mutations) {
+                    for (var m = 0; m < mutations.length; m++) {
+                        for (var n = 0; n < mutations[m].addedNodes.length; n++) {
+                            var node = mutations[m].addedNodes[n];
+                            if (node.tagName === 'VIDEO') {
+                                var src = node.src || node.currentSrc || '';
+                                if (src && src.indexOf('http') === 0) window.__fmVideoSrc = src;
+                                var sources = node.querySelectorAll('source');
+                                for (var s = 0; s < sources.length; s++) {
+                                    src = sources[s].src || sources[s].getAttribute('src') || '';
+                                    if (src && src.indexOf('http') === 0) window.__fmVideoSrc = src;
+                                }
+                            }
+                            if (node.tagName === 'SOURCE') {
+                                var src2 = node.src || node.getAttribute('src') || '';
+                                if (src2 && src2.indexOf('http') === 0) window.__fmVideoSrc = src2;
+                            }
+                        }
+                    }
+                });
+                if (document.body) {
+                    observer.observe(document.body, {childList: true, subtree: true});
+                } else {
+                    document.addEventListener('DOMContentLoaded', function() {
+                        observer.observe(document.body, {childList: true, subtree: true});
+                    });
                 }
             })();
         """.trimIndent()
@@ -307,14 +348,19 @@ class FilemoonExtractor : Extractor() {
                     if (window.__fmUrls && window.__fmUrls.length > 0) {
                         for (var i = 0; i < window.__fmUrls.length; i++) {
                             var data = window.__fmUrls[i];
-                            var urls = data.match(/https?:\/\/[^"'<>\\s]+\.(?:m3u8|mp4)[^"'<>\\s]*/g);
+                            var urls = data.match(/https?:\/\/[^"'<>\s]+\.(?:m3u8|mp4)[^"'<>\s]*/g);
                             if (urls && urls.length > 0) {
                                 return 'URL:' + urls[0];
                             }
                             // Buscar en JSON capturado campos sources/file/url
-                            var srcMatch = data.match(/\"(?:sources|file|url)\"\s*:\s*\"(https?:\/\/[^\"\\]+\"/);
+                            var srcMatch = data.match(/"(?:sources|file|url)"\s*:\s*"(https?:\/\/[^"\\]+)"/);
                             if (srcMatch) return 'URL:' + srcMatch[1];
                         }
+                    }
+
+                    // 1b. Video src capturado por MutationObserver/setAttribute
+                    if (window.__fmVideoSrc && window.__fmVideoSrc.indexOf('http') === 0) {
+                        return 'URL:' + window.__fmVideoSrc;
                     }
 
                     // 2. JWPlayer
@@ -335,11 +381,16 @@ class FilemoonExtractor : Extractor() {
                         }
                     } catch(e) {}
 
-                    // 3. Video element
+                    // 3. Video element + source children
                     var video = document.querySelector('video');
                     if (video) {
                         var src = video.src || video.currentSrc || '';
                         if (src && src.indexOf('http') === 0) return 'URL:' + src;
+                        var sources = video.querySelectorAll('source');
+                        for (var s = 0; s < sources.length; s++) {
+                            src = sources[s].src || sources[s].getAttribute('src') || '';
+                            if (src && src.indexOf('http') === 0) return 'URL:' + src;
+                        }
                     }
 
                     // 4. HTML scan
@@ -349,7 +400,7 @@ class FilemoonExtractor : Extractor() {
                     var mp4 = html.match(/https?:\/\/[^"'<>\s]+\.mp4[^"'<>\s]*/);
                     if (mp4) return 'URL:' + mp4[0];
 
-                    // 5. Buscar en scripts
+                    // 5. Buscar en scripts inline
                     var scripts = document.querySelectorAll('script');
                     for (var i = 0; i < scripts.length; i++) {
                         var text = scripts[i].textContent || '';
@@ -361,15 +412,19 @@ class FilemoonExtractor : Extractor() {
                     var reqCount = window.__fmAllRequests ? window.__fmAllRequests.length : 0;
                     var reqSnippet = '';
                     if (window.__fmAllRequests && window.__fmAllRequests.length > 0) {
-                        reqSnippet = ' reqs=[' + window.__fmAllRequests.slice(0, 5).join(',') + ']';
+                        reqSnippet = ' reqs=[' + window.__fmAllRequests.slice(0, 8).join(',') + ']';
                     }
+                    // Log primeros 300 chars del HTML para diagnostico
+                    var htmlSnippet = html.substring(0, 300).replace(/\n/g, ' ');
                     return 'WAITING:scripts=' + scripts.length +
                            ' captured=' + (window.__fmUrls ? window.__fmUrls.length : 0) +
                            ' total_reqs=' + reqCount +
                            ' html_len=' + html.length +
                            ' react_mounted=' + isReactMounted +
                            ' root_len=' + rootHtmlLen +
-                           reqSnippet;
+                           ' video=' + (video ? 'YES' : 'NO') +
+                           reqSnippet +
+                           ' snippet=' + htmlSnippet;
                 } catch(e) {
                     return 'ERROR:' + e.message;
                 }
@@ -377,9 +432,9 @@ class FilemoonExtractor : Extractor() {
         """.trimIndent()
 
         val attempts = listOf(
-            6000L to 3000L,
-            12000L to 4000L,
-            18000L to 4000L
+            10000L to 5000L,
+            18000L to 5000L,
+            26000L to 4000L
         )
 
         for ((waitMs, extraMs) in attempts) {

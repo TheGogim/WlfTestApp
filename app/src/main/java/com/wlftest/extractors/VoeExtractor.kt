@@ -8,10 +8,12 @@ import org.jsoup.Jsoup
 
 /**
  * VOE extractor.
- * 2025-08: VOE ahora tiene captcha ALTCHA (proof-of-work, no visual).
- * El captcha se resuelve automaticamente via JS.
- * Solucion: usar WebView para que ALTCHA resuelva, esperar redirect,
- * y extraer el JSON de la pagina resultante.
+ * 2025-08: VOE tiene captcha ALTCHA (proof-of-work, no visual).
+ * Se resuelve automaticamente via JS en el WebView.
+ *
+ * La data del video esta encriptada en un <script type="application/json">.
+ * Como esta encriptada (rot13+base64+shift), NO se puede buscar por 'source' o 'mp4'
+ * en el texto crudo. Hay que buscar el script por tamano y tipo, luego desencriptar.
  */
 class VoeExtractor : Extractor() {
     override val name = "VOE"
@@ -36,96 +38,183 @@ class VoeExtractor : Extractor() {
     override suspend fun extractWithWebView(link: String, context: Context): Video {
         LogCollector.log("WEBVIEW", "[VOE] Cargando via WebView (ALTCHA captcha)...")
 
+        // Preload JS: interceptar XHR/fetch por si la pagina entrega la URL via API
+        val preloadJs = """
+            (function() {
+                window.__voeData = null;
+                var origXHROpen = XMLHttpRequest.prototype.open;
+                var origXHRSend = XMLHttpRequest.prototype.send;
+                XMLHttpRequest.prototype.open = function(method, url) {
+                    this.__voeUrl = url;
+                    return origXHROpen.apply(this, arguments);
+                };
+                XMLHttpRequest.prototype.send = function(body) {
+                    var self = this;
+                    this.addEventListener('load', function() {
+                        if (self.responseText && self.responseText.length > 50) {
+                            window.__voeData = 'XHR:' + (self.__voeUrl || '') + ' -> ' + self.responseText.substring(0, 3000);
+                        }
+                    });
+                    return origXHRSend.apply(this, arguments);
+                };
+                if (window.fetch) {
+                    var origFetch = window.fetch.bind(window);
+                    window.fetch = function(input) {
+                        return origFetch.apply(this, arguments).then(function(resp) {
+                            var url = (typeof input === 'string') ? input : (input.url || '');
+                            var cloned = resp.clone();
+                            cloned.text().then(function(text) {
+                                if (text && text.length > 50) {
+                                    window.__voeData = 'FETCH:' + url + ' -> ' + text.substring(0, 3000);
+                                }
+                            });
+                            return resp;
+                        });
+                    };
+                }
+            })();
+        """.trimIndent()
+
         val extractJs = """
             (function() {
                 try {
-                    // Metodo 1: Buscar script type=application/json
-                    var scripts = document.querySelectorAll('script[type="application/json"]');
+                    var html = document.documentElement.innerHTML;
+                    var scripts = document.querySelectorAll('script');
+                    var altchaPresent = !!document.querySelector('altcha-widget') || html.indexOf('altcha') !== -1;
+                    var humanInTitle = document.title && document.title.indexOf('human') !== -1;
+
+                    // Metodo 1: Buscar <script type="application/json"> con contenido significativo
+                    // NOTA: La data esta ENCRYPTADA, NO buscar 'source'/'mp4' en texto crudo
+                    for (var i = 0; i < scripts.length; i++) {
+                        if (scripts[i].getAttribute('type') === 'application/json') {
+                            var text = scripts[i].textContent || '';
+                            // La data encriptada de VOE es >200 chars y contiene los patrones
+                            // de encriptacion (@$, ^^, ~@, etc.) o es suficientemente larga
+                            if (text.length > 200) {
+                                return 'ENCODED:' + text;
+                            }
+                        }
+                    }
+
+                    // Metodo 2: Buscar en TODOS los scripts inline largos que tengan patrones de VOE
+                    // (patrones del DecryptHelper: @$, ^^, ~@, %?, *~, !!, #&)
                     for (var i = 0; i < scripts.length; i++) {
                         var text = scripts[i].textContent || '';
-                        if (text.length > 100 && (text.indexOf('source') !== -1 || text.indexOf('mp4') !== -1 || text.indexOf('m3u8') !== -1)) {
+                        if (text.length > 300 && (text.indexOf('@$') !== -1 || text.indexOf('^^') !== -1 || text.indexOf('~@') !== -1)) {
                             return 'ENCODED:' + text;
                         }
                     }
 
-                    // Metodo 2: Buscar en todos los scripts
-                    scripts = document.querySelectorAll('script');
-                    for (var i = 0; i < scripts.length; i++) {
-                        var text = scripts[i].textContent || '';
-                        if (text.length > 200 && text.indexOf('source') !== -1 && (text.indexOf('mp4') !== -1 || text.indexOf('m3u8') !== -1)) {
-                            return 'ENCODED:' + text;
+                    // Metodo 3: URL directa en el HTML
+                    var m3u8Match = html.match(/https?:\/\/[^"'<>\s]+\.m3u8[^"'<>\s]*/);
+                    if (m3u8Match) return 'DIRECT:' + m3u8Match[0];
+                    var mp4Match = html.match(/https?:\/\/[^"'<>\s]+\.mp4[^"'<>\s]*/);
+                    if (mp4Match) return 'DIRECT:' + mp4Match[0];
+
+                    // Metodo 4: Variables globales comunes
+                    var stateVars = ['__INITIAL_STATE__', '__NUXT__', '__NEXT_DATA__', 'playerConfig', 'videoData'];
+                    for (var v = 0; v < stateVars.length; v++) {
+                        try {
+                            var val = window[stateVars[v]];
+                            if (val) {
+                                var str = JSON.stringify(val);
+                                if (str.length > 50 && (str.indexOf('mp4') !== -1 || str.indexOf('m3u8') !== -1 || str.indexOf('source') !== -1)) {
+                                    return 'STATE:' + str;
+                                }
+                            }
+                        } catch(e) {}
+                    }
+
+                    // Metodo 5: Video element
+                    var video = document.querySelector('video');
+                    if (video) {
+                        var src = video.src || video.currentSrc || '';
+                        if (src && src.indexOf('http') === 0) return 'DIRECT:' + src;
+                        var sources = video.querySelectorAll('source');
+                        for (var s = 0; s < sources.length; s++) {
+                            src = sources[s].src || sources[s].getAttribute('src') || '';
+                            if (src && src.indexOf('http') === 0) return 'DIRECT:' + src;
                         }
                     }
 
-                    // Metodo 3: Si todavia estamos en la pagina de captcha, reportar
-                    if (document.title && document.title.indexOf('human') !== -1) {
+                    // Metodo 6: Datos capturados por XHR/fetch
+                    if (window.__voeData) {
+                        var voeData = window.__voeData;
+                        // Si contiene URL de video directo
+                        var urlMatch = voeData.match(/https?:\/\/[^"'<>\s]+\.(?:mp4|m3u8)[^"'<>\s]*/);
+                        if (urlMatch) return 'DIRECT:' + urlMatch[0];
+                        // Si contiene JSON con source
+                        if (voeData.indexOf('source') !== -1) return 'ENCODED:' + voeData;
+                        // Loggear lo que capturamos
+                        return 'XHR_DATA:' + voeData.substring(0, 500);
+                    }
+
+                    // Si ALTCHA sigue presente, reportar
+                    if (altchaPresent || humanInTitle) {
                         return 'CAPTCHA_STILL_LOADING';
                     }
 
-                    // Metodo 4: Buscar URL de video directa en el HTML
-                    var html = document.documentElement.innerHTML;
-                    var m3u8Match = html.match(/https:\/\/[^"'<>\s]+\.m3u8[^"'<>\s]*/);
-                    if (m3u8Match) return 'DIRECT:' + m3u8Match[0];
-
-                    var mp4Match = html.match(/https:\/\/[^"'<>\s]+\.mp4[^"'<>\s]*/);
-                    if (mp4Match) return 'DIRECT:' + mp4Match[0];
-
-                    // Metodo 5: Buscar en window.__INITIAL_STATE__ u otras variables globales
-                    if (window.__INITIAL_STATE__) {
-                        var stateStr = JSON.stringify(window.__INITIAL_STATE__);
-                        if (stateStr.indexOf('mp4') !== -1 || stateStr.indexOf('m3u8') !== -1) {
-                            return 'STATE:' + stateStr;
-                        }
-                    }
-
-                    return '';
+                    // Debug: retornar informacion de la pagina
+                    return 'WAITING:scripts=' + scripts.length +
+                           ' html_len=' + html.length +
+                           ' title=' + (document.title || 'none') +
+                           ' altcha=' + altchaPresent +
+                           ' appjson=' + document.querySelectorAll('script[type="application/json"]').length;
                 } catch(e) {
                     return 'ERROR:' + e.message;
                 }
             })()
         """.trimIndent()
 
-        // Cargar con espera larga para que ALTCHA resuelva (~5s) + redirect (~3s)
-        val result = WebViewHelper.evaluate(
-            context = context,
-            url = link,
-            js = extractJs,
-            waitForMs = 6000,
-            extraJsWaitMs = 4000
+        // Intentar con tiempos crecientes: ALTCHA puede tardar 3-8s en resolverse
+        val attempts = listOf(
+            8000L to 5000L,
+            15000L to 5000L,
+            22000L to 3000L
         )
 
-        LogCollector.log("WEBVIEW", "[VOE] Resultado: ${result.take(150)}")
+        for ((waitMs, extraMs) in attempts) {
+            try {
+                val result = WebViewHelper.evaluate(
+                    context = context,
+                    url = link,
+                    js = extractJs,
+                    preloadJs = preloadJs,
+                    waitForMs = waitMs,
+                    extraJsWaitMs = extraMs
+                )
 
-        if (result.isEmpty() || result == "null") {
-            throw Exception("No se pudo extraer video de VOE via WebView")
-        }
+                LogCollector.log("WEBVIEW", "[VOE] intento (${waitMs}ms): ${result.take(200)}")
 
-        if (result.startsWith("ERROR:")) {
-            throw Exception(result)
-        }
+                if (result.isEmpty() || result == "null") {
+                    LogCollector.log("WARN", "[VOE] Resultado vacio, reintentando...")
+                    continue
+                }
 
-        if (result.startsWith("DIRECT:")) {
-            val videoUrl = result.removePrefix("DIRECT:")
-            LogCollector.log("SUCCESS", "[VOE] URL directa: ${videoUrl.take(80)}...")
-            return Video(source = videoUrl, type = if (videoUrl.contains(".m3u8")) "application/x-mpegURL" else "video/mp4")
-        }
+                if (result.startsWith("ERROR:")) {
+                    LogCollector.log("WARN", "[VOE] Error en JS: ${result.take(100)}")
+                    continue
+                }
 
-        if (result.startsWith("CAPTCHA_STILL_LOADING")) {
-            LogCollector.log("WARN", "[VOE] ALTCHA todavia cargando, reintentando...")
-            val retryResult = WebViewHelper.evaluate(
-                context = context,
-                url = link,
-                js = extractJs,
-                waitForMs = 8000,
-                extraJsWaitMs = 5000
-            )
-            if (retryResult.startsWith("ENCODED:") || retryResult.startsWith("DIRECT:") || retryResult.startsWith("STATE:")) {
-                return parseResult(retryResult)
+                if (result.startsWith("CAPTCHA_STILL_LOADING")) {
+                    LogCollector.log("WARN", "[VOE] ALTCHA todavia cargando...")
+                    continue
+                }
+
+                if (result.startsWith("WAITING:") || result.startsWith("XHR_DATA:")) {
+                    LogCollector.log("DEBUG", "[VOE] Info: ${result.take(300)}")
+                    continue
+                }
+
+                // Tenemos algo util: DIRECT, ENCODED, STATE
+                return parseResult(result)
+
+            } catch (e: Exception) {
+                LogCollector.log("WARN", "[VOE] Intento fallo: ${e.message}")
             }
-            throw Exception("VOE ALTCHA no se resolvio")
         }
 
-        return parseResult(result)
+        throw Exception("VOE: no se pudo extraer video despues de varios intentos")
     }
 
     private fun parseResult(result: String): Video {
@@ -134,11 +223,19 @@ class VoeExtractor : Extractor() {
 
         if (result.startsWith("ENCODED:")) {
             val encodedString = result.removePrefix("ENCODED:")
+
+            // Si viene de XHR/fetch, puede tener prefijo "XHR:... -> "
+            var pureData = encodedString
+            val arrowIdx = encodedString.indexOf(" -> ")
+            if (arrowIdx !== -1 && arrowIdx < 100) {
+                pureData = encodedString.substring(arrowIdx + 4)
+            }
+
             val decryptedContent: JsonObject = try {
-                DecryptHelper.decrypt(encodedString)
+                DecryptHelper.decrypt(pureData)
             } catch (_: Exception) {
                 try {
-                    JsonParser.parseString(encodedString).asJsonObject
+                    JsonParser.parseString(pureData).asJsonObject
                 } catch (_: Exception) {
                     throw Exception("No se pudo decodificar el JSON de VOE")
                 }
@@ -169,7 +266,7 @@ class VoeExtractor : Extractor() {
                 ?: throw Exception("No se encontro URL de video en state de VOE")
         } else if (result.startsWith("DIRECT:")) {
             val videoUrl = result.removePrefix("DIRECT:")
-            LogCollector.log("SUCCESS", "[VOE] URL directa (parseResult): ${videoUrl.take(80)}...")
+            LogCollector.log("SUCCESS", "[VOE] URL directa: ${videoUrl.take(80)}...")
             return Video(source = videoUrl, type = if (videoUrl.contains(".m3u8")) "application/x-mpegURL" else "video/mp4")
         } else {
             throw Exception("Formato desconocido de resultado VOE: ${result.take(50)}")
