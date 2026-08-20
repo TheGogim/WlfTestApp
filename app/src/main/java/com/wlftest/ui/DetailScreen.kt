@@ -29,21 +29,35 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavController
 import coil.compose.AsyncImage
 import com.wlftest.api.TMDb
 import com.wlftest.model.*
+import com.wlftest.extractors.Extractor
+import com.wlftest.extractors.Video
 import com.wlftest.providers.GnulaProvider
-import com.wlftest.providers.TioPlusProvider
-import kotlinx.coroutines.async
+// TioPlus deshabilitado temporalmente
+// import com.wlftest.providers.TioPlusProvider
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
-class DetailViewModel : ViewModel() {
+class DetailVmFactory(private val app: Application) : ViewModelProvider.Factory {
+    override fun <T : ViewModel> create(modelClass: Class<T>): T {
+        @Suppress("UNCHECKED_CAST")
+        return DetailViewModel(app) as T
+    }
+}
+
+class DetailViewModel(app: Application) : AndroidViewModel(app) {
+
     private val _detail = MutableStateFlow<ShowDetail?>(null)
     val detail: StateFlow<ShowDetail?> = _detail.asStateFlow()
 
@@ -73,6 +87,10 @@ class DetailViewModel : ViewModel() {
     private val _serversLoading = MutableStateFlow(false)
     val serversLoading: StateFlow<Boolean> = _serversLoading.asStateFlow()
 
+    // Indica si se esta extrayendo un servidor (para mostrar spinner en la card)
+    private val _extractingServer = MutableStateFlow<String?>(null)
+    val extractingServer: StateFlow<String?> = _extractingServer.asStateFlow()
+
     // Debug logs
     val logs = LogCollector.entries
 
@@ -82,7 +100,7 @@ class DetailViewModel : ViewModel() {
             _error.value = null
             try {
                 _detail.value = TMDb.getDetail(id, type)
-                // Si es serie, cargar episodios de la temporada 1 automáticamente
+                // Si es serie, cargar episodios de la temporada 1 automaticamente
                 if (type == ShowType.TV) {
                     selectSeason(1)
                 }
@@ -137,63 +155,91 @@ class DetailViewModel : ViewModel() {
             LogCollector.clear()
 
             try {
-                // Lanzar ambos providers en paralelo
-                val gnulaDeferred = async {
-                    try {
-                        if (type == ShowType.TV) {
-                            GnulaProvider.searchServers(
-                                title = title,
-                                type = type,
-                                seasonNum = _selectedSeason.value,
-                                episodeNum = ep!!.episodeNumber,
-                            ).map { s ->
-                                    ProviderServer("Gnula HD", s.language, s.serverName, s.embedUrl, s.domain)
-                                }
-                        } else {
-                            GnulaProvider.searchServers(title = title, type = type).map { s ->
+                // Solo Gnula (TioPlus deshabilitado temporalmente)
+                val gnulaResults = try {
+                    if (type == ShowType.TV) {
+                        GnulaProvider.searchServers(
+                            title = title,
+                            type = type,
+                            seasonNum = _selectedSeason.value,
+                            episodeNum = ep!!.episodeNumber,
+                        ).map { s ->
                                 ProviderServer("Gnula HD", s.language, s.serverName, s.embedUrl, s.domain)
                             }
+                    } else {
+                        GnulaProvider.searchServers(title = title, type = type).map { s ->
+                            ProviderServer("Gnula HD", s.language, s.serverName, s.embedUrl, s.domain)
                         }
-                    } catch (e: Exception) {
-                        LogCollector.log("ERROR", "Gnula: ${e.message}")
-                        emptyList()
                     }
+                } catch (e: Exception) {
+                    LogCollector.log("ERROR", "Gnula: ${e.message}")
+                    emptyList()
                 }
-
-                val tioDeferred = async {
-                    try {
-                        if (type == ShowType.TV) {
-                            TioPlusProvider.searchServers(
-                                title = title,
-                                type = type,
-                                alternateTitle = detail.originalTitle,
-                                seasonNum = _selectedSeason.value,
-                                episodeNum = ep!!.episodeNumber,
-                            )
-                        } else {
-                            TioPlusProvider.searchServers(
-                                title = title,
-                                type = type,
-                                alternateTitle = detail.originalTitle,
-                            )
-                        }
-                    } catch (e: Exception) {
-                        LogCollector.log("ERROR", "TioPlus: ${e.message}")
-                        emptyList()
-                    }
-                }
-
-                val gnulaResults = gnulaDeferred.await()
-                val tioResults = tioDeferred.await()
 
                 val map = mutableMapOf<String, List<ProviderServer>>()
                 if (gnulaResults.isNotEmpty()) map["Gnula HD"] = gnulaResults
-                if (tioResults.isNotEmpty()) map["TioPlus"] = tioResults
                 _providerServers.value = map
 
             } finally {
                 _serversLoading.value = false
             }
+        }
+    }
+
+    /**
+     * Extrae la URL real de video de un servidor.
+     * Retorna el resultado o null si fallo (ya logueado).
+     */
+    suspend fun extractServer(server: ProviderServer): Video? {
+        _extractingServer.value = server.embedUrl
+        return try {
+            val video = Extractor.extract(server.embedUrl, server.providerName)
+            LogCollector.log(
+                "SUCCESS",
+                "═══ URL extraida [${video.type ?: "video"}]: ${video.source} ═══"
+            )
+            video
+        } catch (e: Exception) {
+            LogCollector.log("ERROR", "Extraccion fallida: ${e.message}")
+            null
+        } finally {
+            _extractingServer.value = null
+        }
+    }
+
+    /**
+     * Extrae y copia la URL al clipboard. Se llama desde el Composable.
+     */
+    fun extractAndCopy(server: ProviderServer, context: Context) {
+        viewModelScope.launch {
+            val video = extractServerWithCtx(server)
+            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            if (video != null) {
+                clipboard.setPrimaryClip(ClipData.newPlainText("video", video.source))
+            } else {
+                clipboard.setPrimaryClip(ClipData.newPlainText("embed", server.embedUrl))
+            }
+        }
+    }
+
+    /**
+     * Extrae la URL real de video de un servidor, pasando Application context.
+     * Retorna el resultado o null si fallo (ya logueado).
+     */
+    suspend fun extractServerWithCtx(server: ProviderServer): Video? {
+        _extractingServer.value = server.embedUrl
+        return try {
+            val video = Extractor.extract(server.embedUrl, server.providerName, getApplication())
+            LogCollector.log(
+                "SUCCESS",
+                "═══ URL extraida [${video.type ?: "video"}]: ${video.source} ═══"
+            )
+            video
+        } catch (e: Exception) {
+            LogCollector.log("ERROR", "Extraccion fallida: ${e.message}")
+            null
+        } finally {
+            _extractingServer.value = null
         }
     }
 
@@ -208,7 +254,11 @@ fun DetailScreen(
     navController: NavController,
     id: Int,
     type: ShowType,
-    viewModel: DetailViewModel = androidx.lifecycle.viewmodel.compose.viewModel(),
+    viewModel: DetailViewModel = viewModel(
+        factory = DetailVmFactory(
+            LocalContext.current.applicationContext as Application
+        )
+    ),
 ) {
     val detail by viewModel.detail.collectAsState()
     val loading by viewModel.loading.collectAsState()
@@ -291,7 +341,7 @@ fun DetailScreen(
                         }
                         Spacer(Modifier.height(6.dp))
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text("\u2605 ${"%.1f".format(detail!!.rating)}", color = Color(0xFFFFD700), fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                            Text("★ ${"%.1f".format(detail!!.rating)}", color = Color(0xFFFFD700), fontWeight = FontWeight.Bold, fontSize = 15.sp)
                             detail!!.year?.let { Spacer(Modifier.width(12.dp)); Text(it, color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 14.sp) }
                             detail!!.runtime?.let { Spacer(Modifier.width(12.dp)); Text("${it}min", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 14.sp) }
                             detail!!.numberOfSeasons?.let { Spacer(Modifier.width(12.dp)); Text("$it temp.", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 14.sp) }
@@ -456,7 +506,7 @@ private fun ServersSection(vm: DetailViewModel) {
         Spacer(Modifier.height(12.dp))
     }
 
-    // --- Botón buscar ---
+    // --- Boton buscar ---
     val canSearch = type == ShowType.MOVIE || selectedEpisode != null
     Button(
         onClick = { vm.searchServers() },
@@ -542,9 +592,11 @@ private fun ServersSection(vm: DetailViewModel) {
 
             // Servers de este provider
             servers.forEach { server ->
-                ProviderServerCard(server) {
-                    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                    clipboard.setPrimaryClip(ClipData.newPlainText("embed", server.embedUrl))
+                ProviderServerCard(
+                    server = server,
+                    isExtracting = (vm.extractingServer.collectAsState().value == server.embedUrl),
+                ) {
+                    vm.extractAndCopy(server, context)
                 }
                 Spacer(Modifier.height(4.dp))
             }
@@ -564,7 +616,11 @@ private fun ServersSection(vm: DetailViewModel) {
 // ==================== SERVER CARD ====================
 
 @Composable
-private fun ProviderServerCard(server: ProviderServer, onCopy: () -> Unit) {
+private fun ProviderServerCard(
+    server: ProviderServer,
+    isExtracting: Boolean = false,
+    onTap: () -> Unit,
+) {
     val langColor = when (server.language.lowercase()) {
         "latino", "español latino" -> Color(0xFFE50914)
         "subtitulado" -> Color(0xFF2196F3)
@@ -576,7 +632,7 @@ private fun ProviderServerCard(server: ProviderServer, onCopy: () -> Unit) {
         modifier = Modifier
             .fillMaxWidth()
             .padding(horizontal = 16.dp)
-            .clickable { onCopy() },
+            .clickable(enabled = !isExtracting) { onTap() },
         shape = RoundedCornerShape(10.dp),
         colors = CardDefaults.cardColors(containerColor = Color(0xFF1A1A2E)),
     ) {
@@ -606,9 +662,17 @@ private fun ProviderServerCard(server: ProviderServer, onCopy: () -> Unit) {
                     fontSize = 11.sp,
                 )
             }
-            Icon(Icons.Default.ContentCopy, "Copiar URL", tint = Color(0xFF546E7A), modifier = Modifier.size(18.dp))
+            if (isExtracting) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(18.dp),
+                    color = Color(0xFF69F0AE),
+                    strokeWidth = 2.dp,
+                )
+            } else {
+                Icon(Icons.Default.ContentCopy, "Extraer y copiar URL", tint = Color(0xFF546E7A), modifier = Modifier.size(18.dp))
+            }
         }
-        // URL completa (mono, pequeño)
+        // URL completa (mono, pequeno)
         Text(
             server.embedUrl, color = Color(0xFF455A64), fontSize = 10.sp,
             fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,

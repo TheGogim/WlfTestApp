@@ -59,6 +59,15 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
 
+    // Coroutines (para extractors con Retrofit)
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+
+    // HTML parsing (para extractors)
+    implementation("org.jsoup:jsoup:1.18.1")
+
+    // JSON (para extractors que usan Gson como Rpmvid)
+    implementation("com.google.code.gson:gson:2.11.0")
+
     // Image loading (Coil 2)
     implementation("io.coil-kt:coil-compose:2.7.0")
 }

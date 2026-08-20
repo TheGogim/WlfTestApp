@@ -1,5 +1,6 @@
 package com.wlftest.providers
 
+import android.util.Base64
 import com.wlftest.model.ProviderServer
 import com.wlftest.model.ShowType
 import com.wlftest.ui.LogCollector
@@ -113,6 +114,15 @@ object TioPlusProvider {
 
     // --- Server parsing ---
 
+    /**
+     * Extrae servidores del HTML de la pagina de pelicula/serie.
+     *
+     * IMPORTANTE: El data-server ya es base64, pero el JS de la pagina
+     * (app.js) hace btoa(data-server) antes de construir /player/.
+     * Entonces la URL real necesita DOBLE base64 encode:
+     *   data-server = "abc123" (ya es b64)
+     *   URL = /player/{btoa("abc123")}  (b64 encode del string b64)
+     */
     private fun parseServers(html: String): List<ProviderServer> {
         val servers = mutableListOf<ProviderServer>()
 
@@ -126,9 +136,14 @@ object TioPlusProvider {
         log("PARSE", "${matches.size} servidor(es) en HTML")
 
         for (m in matches) {
-            val b64 = m.groupValues[1]
+            val rawB64 = m.groupValues[1]
             val serverName = m.groupValues[2].trim()
-            val embedUrl = "$BASE_URL/player/$b64"
+            // Doble base64 encode: btoa(data-server) como hace app.js
+            val doubleB64 = Base64.encodeToString(
+                rawB64.toByteArray(Charsets.UTF_8),
+                Base64.NO_WRAP
+            )
+            val embedUrl = "$BASE_URL/player/$doubleB64"
             servers.add(ProviderServer(
                 providerName = PROVIDER_NAME,
                 language = language,
