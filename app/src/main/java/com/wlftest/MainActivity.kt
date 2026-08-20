@@ -52,6 +52,9 @@ private fun ScrapersTestNav() {
                     type = type,
                 )
             }
+            composable("player") {
+                PlayerScreen(navController = navController)
+            }
         }
     }
 }

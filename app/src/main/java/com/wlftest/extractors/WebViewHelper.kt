@@ -15,22 +15,109 @@ import kotlin.coroutines.resumeWithException
 
 /**
  * Utilidad para ejecutar JavaScript en un WebView invisible.
- * Usado por extractors que necesitan renderizado JS (Okru, TioPlus player).
+ *
+ * MEJORAS 2025-08 (anti-detección headless):
+ *  - Configura el WebView para que NO parezca un headless browser.
+ *    Sitios como Filemoon y Rpmvid detectan "Headless Browser" y se rehúsan
+ *    a cargar el React app. Seteamos:
+ *    - desktop User-Agent real
+ *    - DOM storage, indexed DB, cookies habilitados
+ *    - JS habilitado
+ *    - WebViewClient que NO reporta como webdriver
+ *  - Inyecta JS de stealth ANTES de que la página cargue (en onPageStarted):
+ *    - Elimina window.webdriver
+ *    - Patchea navigator.userAgent para no incluir "Headless"
+ *    - Simula propiedades comunes de Chrome desktop (languages, platform, etc.)
  */
 object WebViewHelper {
 
     /**
+     * JS de stealth que se inyecta ANTES de que cualquier script de la página corra.
+     * Oculta señales de headless browser.
+     */
+    private const val STEALTH_JS = """
+        (function() {
+            // 1. Eliminar window.webdriver
+            try {
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined, configurable: true});
+            } catch(e) {}
+            try {
+                window.webdriver = undefined;
+                delete window.webdriver;
+            } catch(e) {}
+
+            // 2. Limpiar navigator.plugins (headless tiene array vacío)
+            try {
+                Object.defineProperty(navigator, 'plugins', {
+                    get: () => [
+                        {name: 'PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format'},
+                        {name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer', description: ''},
+                        {name: 'Chromium PDF Viewer', filename: 'internal-pdf-viewer', description: ''},
+                        {name: 'Microsoft Edge PDF Viewer', filename: 'internal-pdf-viewer', description: ''},
+                        {name: 'WebKit built-in PDF', filename: 'internal-pdf-viewer', description: ''}
+                    ],
+                    configurable: true
+                });
+            } catch(e) {}
+
+            // 3. Simular navigator.languages (headless a veces tiene solo ['en-US'])
+            try {
+                Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en'], configurable: true});
+            } catch(e) {}
+
+            // 4. Simular navigator.platform para Windows
+            try {
+                Object.defineProperty(navigator, 'platform', {get: () => 'Win32', configurable: true});
+            } catch(e) {}
+
+            // 5. Simular navigator.hardwareConcurrency
+            try {
+                Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8, configurable: true});
+            } catch(e) {}
+
+            // 6. Simular navigator.deviceMemory
+            try {
+                Object.defineProperty(navigator, 'deviceMemory', {get: () => 8, configurable: true});
+            } catch(e) {}
+
+            // 7. Simular WebGL vendor y renderer (headless tiene MockRenderer)
+            try {
+                const getParameter = WebGLRenderingContext.prototype.getParameter;
+                WebGLRenderingContext.prototype.getParameter = function(p) {
+                    if (p === 37445) return 'Intel Inc.';          // UNMASKED_VENDOR_WEBGL
+                    if (p === 37446) return 'Intel Iris OpenGL Engine';  // UNMASKED_RENDERER_WEBGL
+                    return getParameter.call(this, p);
+                };
+            } catch(e) {}
+
+            // 8. Chrome runtime mock (sitios verifican window.chrome)
+            try {
+                if (!window.chrome) {
+                    window.chrome = {runtime: {}, app: {isInstalled: false}};
+                }
+            } catch(e) {}
+
+            // 9. Notification permission mock
+            try {
+                if (window.Notification) {
+                    Notification.permission = 'default';
+                }
+            } catch(e) {}
+
+            // 10. Eliminar 'HeadlessChrome' del userAgent si está
+            try {
+                const origUA = navigator.userAgent;
+                if (origUA.indexOf('HeadlessChrome') !== -1) {
+                    const cleanUA = origUA.replace('HeadlessChrome', 'Chrome');
+                    Object.defineProperty(navigator, 'userAgent', {get: () => cleanUA, configurable: true});
+                }
+            } catch(e) {}
+        })();
+    """
+
+    /**
      * Carga una URL en un WebView invisible, espera a que cargue,
      * ejecuta JavaScript y retorna el resultado.
-     *
-     * @param context Application context
-     * @param url URL a cargar
-     * @param js JavaScript a ejecutar despues de la carga
-     * @param preloadJs JavaScript a inyectar ANTES de que la pagina ejecute sus scripts (en onPageStarted)
-     * @param waitForMs milisegundos extra a esperar despues de onPageFinished
-     * @param redirectCapture si true, captura la primera redirect como resultado
-     * @param extraJsWaitMs milisegundos adicionales antes de reintentar el JS
-     * @return resultado del JS o la URL de redirect capturada
      */
     @SuppressLint("SetJavaScriptEnabled")
     suspend fun evaluate(
@@ -47,11 +134,19 @@ object WebViewHelper {
             handler.post {
                 try {
                     val webView = WebView(context.applicationContext)
+                    // Configuración anti-detección
                     webView.settings.javaScriptEnabled = true
                     webView.settings.domStorageEnabled = true
+                    webView.settings.databaseEnabled = true
                     webView.settings.loadWithOverviewMode = true
                     webView.settings.useWideViewPort = true
+                    webView.settings.mediaPlaybackRequiresUserGesture = false
+                    webView.settings.javaScriptCanOpenWindowsAutomatically = true
+                    // User-Agent de Chrome desktop real (sin "HeadlessChrome" ni "wv" que delatan WebView Android)
                     webView.settings.userAgentString = HttpHelper.UA
+                    // Aceptar cookies
+                    android.webkit.CookieManager.getInstance().setAcceptCookie(true)
+                    android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
 
                     var finished = false
                     fun finish(result: String) {
@@ -75,11 +170,15 @@ object WebViewHelper {
                     webView.webViewClient = object : WebViewClient() {
 
                         override fun onPageStarted(view: WebView?, pageUrl: String?, favicon: android.graphics.Bitmap?) {
-                            // Inyectar JS ANTES de que los scripts de la pagina se ejecuten
-                            // Esto permite interceptar XHR/fetch antes de que la pagina los use
-                            if (preloadJs != null && !finished) {
-                                view?.evaluateJavascript(preloadJs) { _ ->
-                                    LogCollector.log("WEBVIEW", "Preload JS inyectado en onPageStarted")
+                            // Inyectar stealth JS PRIMERO (antes que cualquier script de la página)
+                            if (!finished) {
+                                view?.evaluateJavascript(STEALTH_JS) { _ ->
+                                    // Luego el preloadJs del extractor (si lo hay)
+                                    if (preloadJs != null && !finished) {
+                                        view?.evaluateJavascript(preloadJs) { _ ->
+                                            LogCollector.log("WEBVIEW", "Preload JS inyectado en onPageStarted")
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -89,7 +188,6 @@ object WebViewHelper {
                             request: WebResourceRequest?
                         ): Boolean {
                             val redirectUrl = request?.url?.toString() ?: return false
-                            // Ignorar recursos internos
                             if (redirectUrl.contains("beacon.min.js") ||
                                 redirectUrl.contains("doubleclick.net") ||
                                 redirectUrl.contains("googlesyndication")) {
@@ -108,24 +206,33 @@ object WebViewHelper {
                                 if (finished) return@postDelayed
                                 view?.evaluateJavascript(js) { result ->
                                     if (finished) return@evaluateJavascript
-                                    // evaluateJavascript returns JSON-serialized results.
-                                    // If JS returns a string, it comes wrapped in quotes: "DIRECT:https://..."
-                                    // Strip surrounding quotes to get the actual string value.
                                     var cleaned = result?.trim() ?: ""
                                     if (cleaned.length >= 2 && cleaned.startsWith("\"") && cleaned.endsWith("\"")) {
                                         cleaned = cleaned.substring(1, cleaned.length - 1)
+                                        // Unescape sequences comunes que devuelve evaluateJavascript
+                                        cleaned = cleaned.replace("\\n", "\n")
+                                            .replace("\\r", "")
+                                            .replace("\\\"", "\"")
+                                            .replace("\\'", "'")
+                                            .replace("\\\\", "\\")
+                                            .replace("\\/", "/")
                                     }
                                     if (redirectCapture) {
                                         if (cleaned.isNotEmpty() && cleaned != "null") {
                                             finish(cleaned)
                                         } else {
-                                            // Esperar un poco mas y reintentar
                                             handler.postDelayed({
                                                 if (finished) return@postDelayed
                                                 view?.evaluateJavascript(js) { result2 ->
                                                     var r2 = result2?.trim() ?: ""
                                                     if (r2.length >= 2 && r2.startsWith("\"") && r2.endsWith("\"")) {
                                                         r2 = r2.substring(1, r2.length - 1)
+                                                        r2 = r2.replace("\\n", "\n")
+                                                            .replace("\\r", "")
+                                                            .replace("\\\"", "\"")
+                                                            .replace("\\'", "'")
+                                                            .replace("\\\\", "\\")
+                                                            .replace("\\/", "/")
                                                     }
                                                     finish(r2)
                                                 }
@@ -151,7 +258,7 @@ object WebViewHelper {
                                 Exception("WebView timeout para $url")
                             )
                         }
-                    }, 30000)
+                    }, 60000)  // 60s — algunos sitios tardan en cargar
                 } catch (e: Exception) {
                     if (cont.isActive) cont.resumeWithException(e)
                 }

@@ -238,7 +238,24 @@ class RpmvidExtractor : Extractor() {
             !configUrl.isNullOrEmpty() -> {
                 configUrl to mapOf("Referer" to mainLink)
             }
-            else -> throw Exception("Missing hls, hlsVideoTiktok, cf or url/source/file in response")
+            else -> {
+                // Diagnóstico detallado: este mirror no entrega streams directamente en
+                // /api/v1/video. Esto pasa con mirrors como dtpg.rpmplay.xyz que
+                // requieren un handshake adicional vía /api/v1/player?t=TOKEN.
+                // Como ese token se obtiene de manera opaca en el browser, no es
+                // viable replicarlo estáticamente.
+                val hasStreamingConfig = json.get("streamingConfig") != null
+                LogCollector.log(
+                    "WARN",
+                    "[Rpmvid] Mirror '$mainLink' no devuelve streams directos en /api/v1/video. " +
+                    "streamingConfig presente: $hasStreamingConfig. " +
+                    "Top-level keys: ${json.keySet().joinToString(", ")}"
+                )
+                throw Exception(
+                    "Rpmvid: este mirror ($mainLink) requiere un handshake de player que no es " +
+                    "estáticamente replicable. Intentar con otro servidor (Vidara, Vidsonic, VOE)."
+                )
+            }
         }
 
         return Video(

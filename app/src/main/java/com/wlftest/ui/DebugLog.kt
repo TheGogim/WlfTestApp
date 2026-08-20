@@ -33,6 +33,7 @@ import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -55,7 +56,9 @@ object LogCollector {
 
     fun log(tag: String, msg: String) {
         val entry = LogEntry(System.currentTimeMillis(), tag, msg)
-        _entries.value = _entries.value + entry
+        // update{} es atómico — multiple coroutines pueden llamar log() en paralelo
+        // sin perder entradas (el viejo `value = value + entry` tenía race condition).
+        _entries.update { it + entry }
     }
 }
 

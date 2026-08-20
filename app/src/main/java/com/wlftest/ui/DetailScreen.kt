@@ -47,6 +47,7 @@ import com.wlftest.providers.GnulaProvider
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 
 class DetailVmFactory(private val app: Application) : ViewModelProvider.Factory {
@@ -90,6 +91,16 @@ class DetailViewModel(app: Application) : AndroidViewModel(app) {
     // Indica si se esta extrayendo un servidor (para mostrar spinner en la card)
     private val _extractingServer = MutableStateFlow<String?>(null)
     val extractingServer: StateFlow<String?> = _extractingServer.asStateFlow()
+
+    // --- Player state (botón "Reproducir ahora") ---
+    private val _playerLoading = MutableStateFlow(false)
+    val playerLoading: StateFlow<Boolean> = _playerLoading.asStateFlow()
+
+    private val _playerReady = MutableStateFlow(false)
+    val playerReady: StateFlow<Boolean> = _playerReady.asStateFlow()
+
+    private val _playerError = MutableStateFlow<String?>(null)
+    val playerError: StateFlow<String?> = _playerError.asStateFlow()
 
     // Debug logs
     val logs = LogCollector.entries
@@ -205,6 +216,161 @@ class DetailViewModel(app: Application) : AndroidViewModel(app) {
         } finally {
             _extractingServer.value = null
         }
+    }
+
+    /**
+     * Flujo "Reproducir ahora":
+     * 1. Llama a Gnula para obtener todos los servidores.
+     * 2. Filtra a SOLO los 3 extractores que funcionan: Vidara, Vidsonic, VOE.
+     * 3. Lanza extracciones EN PARALELO para los 3.
+     * 4. El primero que termine OK → setea PlayerSessionHolder y marca _playerReady=true
+     *    (la UI navega al PlayerScreen).
+     * 5. Los demás (cuando terminen) → se agregan a availableServers en PlayerSessionHolder
+     *    (PlayerScreen los mostrará en el bottom sheet, sin cambiar el playback actual).
+     */
+    fun playNow() {
+        val detail = _detail.value ?: return
+        val title = detail.title
+        val type = detail.type
+        val ep = _selectedEpisode.value
+
+        if (type == ShowType.TV && ep == null) {
+            LogCollector.log("ERROR", "Selecciona un episodio primero")
+            return
+        }
+
+        viewModelScope.launch {
+            _playerLoading.value = true
+            _playerError.value = null
+            _playerReady.value = false
+            LogCollector.clear()
+            PlayerSessionHolder.clear()
+
+            try {
+                LogCollector.log("INFO", "═══ Reproducir ahora: $title ═══")
+
+                // 1. Obtener todos los servidores de Gnula
+                val gnulaServers = try {
+                    if (type == ShowType.TV) {
+                        GnulaProvider.searchServers(
+                            title = title,
+                            type = type,
+                            seasonNum = _selectedSeason.value,
+                            episodeNum = ep!!.episodeNumber,
+                        )
+                    } else {
+                        GnulaProvider.searchServers(title = title, type = type)
+                    }
+                } catch (e: Exception) {
+                    LogCollector.log("ERROR", "Gnula: ${e.message}")
+                    emptyList()
+                }
+
+                if (gnulaServers.isEmpty()) {
+                    _playerError.value = "No se encontraron servidores en Gnula"
+                    return@launch
+                }
+
+                // 2. Filtrar a solo los 3 extractores que funcionan
+                val workingServers = gnulaServers.filter { isWorkingExtractor(it.domain) }
+                    .distinctBy { it.embedUrl }
+
+                LogCollector.log(
+                    "INFO",
+                    "Probando en paralelo: ${workingServers.joinToString { it.domain }}"
+                )
+
+                if (workingServers.isEmpty()) {
+                    _playerError.value =
+                        "Ninguno de los servidores que funcionan (Vidara, Vidsonic, VOE) está disponible"
+                    return@launch
+                }
+
+                // 3. Resolver en paralelo
+                val resolved = java.util.Collections.synchronizedList(mutableListOf<ResolvedServer>())
+                val jobs = workingServers.map { server ->
+                    launch {
+                        try {
+                            LogCollector.log("EXTRACTOR", "Usando ${server.serverName} para ${server.embedUrl}")
+                            val video = Extractor.extract(
+                                server.embedUrl,
+                                "Gnula HD",
+                                getApplication(),
+                            )
+                            if (video.source.isNotEmpty()) {
+                                val rs = ResolvedServer(
+                                    language = server.language,
+                                    serverName = server.serverName,
+                                    domain = server.domain,
+                                    embedUrl = server.embedUrl,
+                                    video = video,
+                                )
+                                synchronized(resolved) {
+                                    resolved.add(rs)
+                                    LogCollector.log(
+                                        "SUCCESS",
+                                        "[${server.serverName}] OK: ${video.source.take(80)}..."
+                                    )
+
+                                    // Primer servidor en resolver → iniciar playback
+                                    if (resolved.size == 1) {
+                                        PlayerSessionHolder.start(
+                                            PlaybackState(
+                                                title = title,
+                                                subtitle = if (type == ShowType.TV) {
+                                                    "T${_selectedSeason.value}E${ep!!.episodeNumber}"
+                                                } else "",
+                                                activeVideo = video,
+                                                activeServerName = server.serverName,
+                                                availableServers = resolved.toList(),
+                                            )
+                                        )
+                                        _playerReady.value = true
+                                    } else {
+                                        // Otro servidor resuelto → agregar a la lista
+                                        PlayerSessionHolder.updateAvailableServers(resolved.toList())
+                                    }
+                                }
+                            }
+                        } catch (e: Exception) {
+                            LogCollector.log("ERROR", "[${server.serverName}] ${e.message}")
+                        }
+                    }
+                }
+                jobs.joinAll()
+
+                // Actualización final de la lista de disponibles
+                if (resolved.isNotEmpty()) {
+                    PlayerSessionHolder.updateAvailableServers(resolved.toList())
+                }
+
+                if (resolved.isEmpty()) {
+                    _playerError.value =
+                        "Ninguno de los ${workingServers.size} servidores pudo ser resuelto"
+                }
+            } finally {
+                _playerLoading.value = false
+            }
+        }
+    }
+
+    /**
+     * Determina si un dominio corresponde a uno de los 3 extractores que funcionan
+     * (Vidara, Vidsonic, VOE). Lo demás (Filemoon, Savefiles, ok.ru, Rpmvid) se omite.
+     */
+    private fun isWorkingExtractor(domain: String): Boolean {
+        val d = domain.lowercase()
+        return d.contains("vidara") ||
+               d.contains("vidsonic") ||
+               d.contains("voe")
+    }
+
+    /**
+     * Lo llama la UI después de navegar al player, para que el flag se resetee
+     * y no vuelva a navegar al rotar la pantalla o re-entrar a la screen.
+     */
+    fun consumePlayerReady() {
+        _playerReady.value = false
     }
 
     /**
@@ -395,7 +561,7 @@ fun DetailScreen(
                 Spacer(Modifier.height(32.dp))
 
                 // ===== SECCION SERVIDORES =====
-                ServersSection(viewModel)
+                ServersSection(viewModel, navController)
 
                 Spacer(Modifier.height(32.dp))
             }
@@ -406,7 +572,7 @@ fun DetailScreen(
 // ==================== SERVERS SECTION ====================
 
 @Composable
-private fun ServersSection(vm: DetailViewModel) {
+private fun ServersSection(vm: DetailViewModel, navController: NavController) {
     val detail by vm.detail.collectAsState()
     val type = detail?.type ?: return
     val selectedSeason by vm.selectedSeason.collectAsState()
@@ -505,6 +671,62 @@ private fun ServersSection(vm: DetailViewModel) {
         }
         Spacer(Modifier.height(12.dp))
     }
+
+    // --- Boton reproducir ahora ---
+    val canPlay = type == ShowType.MOVIE || selectedEpisode != null
+    val playerLoading by vm.playerLoading.collectAsState()
+    val playerReady by vm.playerReady.collectAsState()
+    val playerError by vm.playerError.collectAsState()
+
+    // Cuando playNow() resuelve el primer servidor, navegar al PlayerScreen.
+    LaunchedEffect(playerReady) {
+        if (playerReady) {
+            navController.navigate("player")
+            vm.consumePlayerReady()
+        }
+    }
+
+    Button(
+        onClick = { vm.playNow() },
+        enabled = canPlay && !playerLoading,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp)
+            .height(52.dp),
+        shape = RoundedCornerShape(12.dp),
+        colors = ButtonDefaults.buttonColors(
+            containerColor = if (playerLoading) Color(0xFF333333) else Color(0xFF4CAF50),
+        ),
+    ) {
+        if (playerLoading) {
+            CircularProgressIndicator(modifier = Modifier.size(20.dp), color = Color.White, strokeWidth = 2.dp)
+            Spacer(Modifier.width(12.dp))
+            Text("Resolviendo servidores...", color = Color.White, fontWeight = FontWeight.Bold)
+        } else {
+            Icon(Icons.Default.PlayArrow, null, modifier = Modifier.size(22.dp))
+            Spacer(Modifier.width(8.dp))
+            Text(
+                when {
+                    type == ShowType.MOVIE -> "Reproducir ahora"
+                    selectedEpisode != null -> "Reproducir T${selectedSeason}E${selectedEpisode!!.episodeNumber}"
+                    else -> "Selecciona un episodio"
+                },
+                color = Color.White, fontWeight = FontWeight.Bold, fontSize = 15.sp,
+            )
+        }
+    }
+
+    if (playerError != null) {
+        Spacer(Modifier.height(6.dp))
+        Text(
+            playerError!!,
+            color = MaterialTheme.colorScheme.error,
+            fontSize = 12.sp,
+            modifier = Modifier.padding(horizontal = 16.dp),
+        )
+    }
+
+    Spacer(Modifier.height(8.dp))
 
     // --- Boton buscar ---
     val canSearch = type == ShowType.MOVIE || selectedEpisode != null
